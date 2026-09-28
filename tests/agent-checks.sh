@@ -99,7 +99,7 @@ expect_fail "direct DNS to outside servers is blocked ($TEST_DNS_SERVER:53)" dns
 if [ -n "$HOST_TEST_IP" ] && [ -n "$HOST_TEST_PORT" ]; then
   expect_fail "your computer (WSL host) is unreachable ($HOST_TEST_IP:$HOST_TEST_PORT)" tcp_connect "$HOST_TEST_IP" "$HOST_TEST_PORT"
 else
-  skp "your computer (WSL host) is unreachable" "no test listener"
+  skp "your computer (WSL host) is unreachable" "the control found no path to test, so this would prove nothing"
 fi
 if [ ! -d /proc/sys/net/ipv6 ]; then ok "IPv6 is unavailable (kernel has no IPv6; no way around the IPv4 rules)"
 elif [ "$(cat /proc/sys/net/ipv6/conf/all/disable_ipv6 2>/dev/null)" = "1" ]; then ok "IPv6 is disabled (no way around the IPv4 rules)"

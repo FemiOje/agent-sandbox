@@ -2,9 +2,10 @@
 #
 # Security tests for the running sandbox. Run from WSL:  ./sandbox test
 #
-# 1. Control checks from your computer (WSL), outside the sandbox: they show
-#    each blocked target really is reachable without the firewall, so a
-#    "blocked" result below is caused by the sandbox, not by a dead server.
+# 1. Control checks outside the sandbox's firewall (from WSL, or from a
+#    throwaway container without the firewall): they show each blocked target
+#    really is reachable without the firewall, so a "blocked" result below is
+#    caused by the sandbox, not by a dead server.
 # 2. Agent checks inside the sandbox, run as the agent user through the same
 #    path as ./sandbox shell and ./sandbox claude.
 # 3. Admin checks as root, confirming the firewall survived the agent's
@@ -58,7 +59,7 @@ else
   bad "entrypoint dropped root" "log line not found"
 fi
 
-echo "== Controls (from WSL, outside the sandbox)"
+echo "== Controls (outside the sandbox's firewall)"
 if curl -s --connect-timeout 6 --max-time 10 -o /dev/null "$TEST_BLOCKED_URL"; then
   ok "control: $TEST_BLOCKED_URL is reachable from WSL"
 else
@@ -75,25 +76,51 @@ else
   skp "control: DNS server $TEST_DNS_SERVER answers from WSL" "no answer or no python3"
 fi
 
-# A throwaway web server on your computer. If the sandbox can't reach it
-# while WSL can, the sandbox has no network path to your machine.
+# A throwaway web server on your computer. The control is a container on the
+# sandbox's network, from the sandbox's image, but WITHOUT its firewall: if
+# that container reaches the server and the agent can't, the firewall is what
+# blocks the path. Where your computer sits depends on the engine:
+#   Docker Engine inside WSL: the network gateway is WSL itself
+#   Docker Desktop:           host.docker.internal (Windows, which forwards
+#                             localhost ports to WSL)
+# The agent is only tested against an address the control actually reached.
+sandbox_cid="$(docker compose ps -q "$SERVICE" | head -1)"
+# By name, not ID: after a rebuild the running container's image ID may no
+# longer be runnable (Docker Desktop's image store), and the control only needs
+# the sandbox's network and a shell.
+sandbox_image="$(docker inspect -f '{{.Config.Image}}' "$sandbox_cid")"
+sandbox_net="$(docker inspect -f '{{range $k, $v := .NetworkSettings.Networks}}{{$k}} {{end}}' "$sandbox_cid" | awk '{ print $1 }')"
+unfirewalled() {
+  docker run --rm --network "$sandbox_net" --add-host host.docker.internal:host-gateway \
+    --entrypoint bash "$sandbox_image" -c "$1" 2>/dev/null | tr -d '\r'
+}
+
 gw_hex="$(root_exec awk '$2 == "00000000" { print $3; exit }' /proc/net/route | tr -d '\r')"
-HOST_TEST_IP=""
+gw_ip=""
 if [[ "$gw_hex" =~ ^[0-9A-Fa-f]{8}$ ]]; then
-  HOST_TEST_IP="$(printf '%d.%d.%d.%d' "0x${gw_hex:6:2}" "0x${gw_hex:4:2}" "0x${gw_hex:2:2}" "0x${gw_hex:0:2}")"
+  gw_ip="$(printf '%d.%d.%d.%d' "0x${gw_hex:6:2}" "0x${gw_hex:4:2}" "0x${gw_hex:2:2}" "0x${gw_hex:0:2}")"
 fi
-if [ -n "$HOST_TEST_IP" ] && command -v python3 >/dev/null 2>&1; then
+hdi_ip="$(unfirewalled "getent ahostsv4 host.docker.internal | awk '{ print \$1; exit }'")"
+
+HOST_TEST_IP=""
+if [ -z "$sandbox_image" ] || [ -z "$sandbox_net" ] || [ "$(unfirewalled 'echo started')" != "started" ]; then
+  skp "control: test server on your computer" "could not start a control container from '${sandbox_image:-?}' on '${sandbox_net:-?}'"
+elif command -v python3 >/dev/null 2>&1; then
   python3 -m http.server "$HOST_TEST_PORT" --bind 0.0.0.0 >/dev/null 2>&1 &
   listener_pid=$!
   sleep 1
-  if tcp_connect "$HOST_TEST_IP" "$HOST_TEST_PORT"; then
-    ok "control: test server on your computer is reachable at $HOST_TEST_IP:$HOST_TEST_PORT"
+  for ip in $(printf '%s\n' "$hdi_ip" "$gw_ip" | grep -E '^[0-9.]+$' | awk '!seen[$0]++'); do
+    if unfirewalled "timeout 6 bash -c 'exec 3<>/dev/tcp/$ip/$HOST_TEST_PORT' && echo reached" | grep -q reached; then
+      HOST_TEST_IP="$ip"; break
+    fi
+  done
+  if [ -n "$HOST_TEST_IP" ]; then
+    ok "control: a container without the firewall reaches a test server on your computer ($HOST_TEST_IP:$HOST_TEST_PORT)"
   else
-    skp "control: test server on your computer" "not reachable even from WSL"
+    skp "control: test server on your computer" "no container path to it found (tried: ${hdi_ip:-no host.docker.internal} ${gw_ip:-no gateway})"
   fi
 else
-  skp "control: test server on your computer" "no python3 or gateway IP"
-  HOST_TEST_IP=""
+  skp "control: test server on your computer" "no python3 in WSL"
 fi
 
 rules_before="$(root_exec iptables -S | tr -d '\r')"
