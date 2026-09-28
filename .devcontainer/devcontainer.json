@@ -1,0 +1,18 @@
+// VS Code "Reopen in Container" for the sandbox.
+//
+// remoteUser is the important line: without it VS Code connects as root, so
+// its server, extensions and every terminal hold NET_ADMIN and can rewrite
+// the firewall. As "node" they have no capabilities and no_new_privs.
+//
+// Don't set containerUser: the entrypoint must start as root to apply the
+// firewall before dropping to the agent user.
+{
+  "name": "agent-sandbox",
+  "dockerComposeFile": "../docker-compose.yml",
+  "service": "sandbox",
+  "workspaceFolder": "/home/node/work",
+  "remoteUser": "node",
+  "updateRemoteUserUID": false,
+  "overrideCommand": false,
+  "shutdownAction": "none"
+}

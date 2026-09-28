@@ -69,6 +69,18 @@ Key points:
 change the firewall. Use `./sandbox shell`, `./sandbox claude`, or run
 `agent-exec <command>` inside the admin shell.
 
+## VS Code (Dev Containers)
+
+Open this folder in VS Code and run **Dev Containers: Reopen in Container**.
+`.devcontainer/devcontainer.json` connects as `node`, so the VS Code server,
+its extensions and its terminals have no capabilities.
+
+Don't use **Attach to Running Container** without setting `"remoteUser": "node"`
+in the attached container's config (**Dev Containers: Open Named Container
+Configuration File**). Otherwise VS Code connects as root, and so does every
+terminal and extension. `./sandbox test` fails its "no root processes" check
+while such a session is open.
+
 ## Tests
 
 `./sandbox test` checks, in order:
