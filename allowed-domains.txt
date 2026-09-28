@@ -1,0 +1,45 @@
+# What the sandbox may reach over HTTP/HTTPS. One entry per line: a domain,
+# an IPv4 address or an IPv4 CIDR. "#" starts a comment.
+# After editing, apply with:  ./sandbox firewall
+
+# --- Package registries (npm, yarn, Corepack's Yarn downloads) ---
+registry.npmjs.org
+registry.yarnpkg.com
+repo.yarnpkg.com
+
+# --- GitHub (git clone, submodules like forge-std, release downloads) ---
+# GitHub's own IP ranges are added automatically; these cover the CDN hosts.
+github.com
+api.github.com
+codeload.github.com
+raw.githubusercontent.com
+objects.githubusercontent.com
+release-assets.githubusercontent.com
+
+# --- Solidity compiler downloads (Foundry and Hardhat) ---
+binaries.soliditylang.org
+
+# --- RPC providers and block explorers (testnet deploys, mainnet forks) ---
+eth-sepolia.g.alchemy.com
+eth-mainnet.g.alchemy.com
+api.etherscan.io
+
+# --- Deploying frontends ---
+vercel.com
+api.vercel.com
+
+# --- Claude Code (remove if you use a different agent) ---
+api.anthropic.com
+claude.ai
+console.anthropic.com
+statsig.anthropic.com
+statsig.com
+sentry.io
+
+# --- Optional: uncomment as needed ---
+# foundry.paradigm.xyz          # running foundryup inside the sandbox
+# fonts.googleapis.com          # Next.js builds that fetch Google Fonts
+# fonts.gstatic.com
+# sepolia.infura.io             # Infura instead of Alchemy
+# pypi.org                      # Python projects
+# files.pythonhosted.org

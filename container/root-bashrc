@@ -1,0 +1,8 @@
+# Admin (root) shell inside the sandbox, opened with `./sandbox admin`.
+[ -f /etc/bash.bashrc ] && . /etc/bash.bashrc
+
+PS1='\[\e[1;31m\]ADMIN\[\e[0m\] \u@sandbox:\w# '
+
+printf '\n\033[1;31m%s\033[0m\n%s\n\n' \
+  "*** ADMIN SHELL (root, can change the firewall) ***" \
+  "Don't run agents here. Use ./sandbox shell or ./sandbox claude, or run: agent-exec <command>"

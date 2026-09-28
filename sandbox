@@ -1,0 +1,58 @@
+#!/usr/bin/env bash
+#
+# Helper for the agent sandbox. Run from WSL: ./sandbox <command>
+#
+set -euo pipefail
+cd "$(dirname "$(readlink -f "$0")")"
+
+SERVICE=sandbox
+dc() { docker compose "$@"; }
+
+usage() {
+  cat <<'EOF'
+Usage: ./sandbox <command>
+
+  up                Build (if needed) and start; waits until the firewall is ready
+  shell             Open a shell as the agent user (no root, no capabilities)
+  claude [args]     Run Claude Code as the agent user
+  run <cmd...>      Run any command as the agent user
+  admin             Open a ROOT shell (for you only; can change the firewall)
+  firewall          Re-apply the firewall after editing allowed-domains.txt
+  test              Run the security tests against the running sandbox
+  status            Show container status
+  logs              Follow container logs
+  cp-out <path> [dest]  Copy work/<path> out of the sandbox (default: ./exports/)
+  cp-in <src> [path]    Copy a file or folder into work/[path]
+  stop              Stop the container (keeps your code)
+  down              Remove the container (keeps your code in the volume)
+  destroy           Remove the container AND the volumes (deletes your code)
+EOF
+}
+
+cmd="${1:-help}"
+[ "$#" -gt 0 ] && shift
+
+case "$cmd" in
+  up)       dc up -d --build --wait "$@" && echo "Sandbox ready. Try: ./sandbox shell" ;;
+  shell)    dc exec "$SERVICE" agent-exec bash -l ;;
+  claude)   dc exec "$SERVICE" agent-exec claude "$@" ;;
+  run)      [ "$#" -gt 0 ] || { echo "usage: ./sandbox run <command...>"; exit 1; }
+            dc exec "$SERVICE" agent-exec "$@" ;;
+  admin)    dc exec "$SERVICE" bash ;;
+  firewall) dc exec "$SERVICE" init-firewall.sh ;;
+  test)     ./tests/run-tests.sh "$@" ;;
+  status)   dc ps ;;
+  logs)     dc logs -f "$SERVICE" ;;
+  cp-out)   [ "$#" -ge 1 ] || { echo "usage: ./sandbox cp-out <path> [dest]"; exit 1; }
+            dest="${2:-./exports/}"; mkdir -p "$(dirname "$dest")" ./exports
+            dc cp "$SERVICE:/home/node/work/$1" "$dest" ;;
+  cp-in)    [ "$#" -ge 1 ] || { echo "usage: ./sandbox cp-in <src> [path]"; exit 1; }
+            dc cp -a "$1" "$SERVICE:/home/node/work/${2:-}" ;;
+  stop)     dc stop ;;
+  down)     dc down ;;
+  destroy)  read -r -p "Delete the sandbox AND all code in its volumes? [y/N] " ans
+            [ "$ans" = "y" ] || [ "$ans" = "Y" ] || { echo "Cancelled."; exit 0; }
+            dc down -v ;;
+  help|-h|--help) usage ;;
+  *) echo "Unknown command: $cmd"; echo; usage; exit 1 ;;
+esac

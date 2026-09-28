@@ -1,0 +1,23 @@
+name: sandbox security tests
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build and start the sandbox
+        run: ./sandbox up
+
+      - name: Run security tests
+        run: ./sandbox test
+
+      - name: Show logs
+        if: always()
+        run: docker compose logs

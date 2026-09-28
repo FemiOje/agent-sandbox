@@ -1,0 +1,52 @@
+# One container: the entrypoint applies the firewall as root, then drops to
+# the unprivileged agent user. Settings come from .env (see .env.example).
+services:
+  sandbox:
+    build:
+      context: .
+      args:
+        INSTALL_FOUNDRY: ${INSTALL_FOUNDRY:-true}
+        INSTALL_CLAUDE_CODE: ${INSTALL_CLAUDE_CODE:-true}
+    hostname: sandbox
+    # No "user:" here on purpose. The entrypoint must start as root to set
+    # the firewall; it then drops to the agent user (see container/agent-exec).
+    cap_drop: [ALL]
+    cap_add:
+      - NET_ADMIN   # set the firewall (only root holds it: entrypoint + ./sandbox admin)
+      - NET_RAW
+      - SETUID      # switch to the agent user
+      - SETGID
+      - SETPCAP     # remove every capability from the agent's processes
+    security_opt:
+      - no-new-privileges:true
+    environment:
+      INBOUND_PORTS: "3000,8545"
+      DNS_ALLOW_ANY: ${DNS_ALLOW_ANY:-false}
+      IPTABLES: ${IPTABLES:-iptables}
+    volumes:
+      # Read-only allowlist. Everything else is a named volume: no folders
+      # from your PC or WSL are mounted.
+      - ./allowed-domains.txt:/etc/sandbox/allowed-domains.txt:ro
+      - workspace:/home/node/work
+      - agent-config:/home/node/.claude
+    ports:
+      # Localhost only; reachable from your Windows browser through WSL
+      - "127.0.0.1:${FRONTEND_PORT:-3000}:3000"   # web frontend (Next.js)
+      - "127.0.0.1:${CHAIN_PORT:-8545}:8545"      # local chain (anvil/hardhat)
+    sysctls:
+      net.ipv6.conf.all.disable_ipv6: 1
+      net.ipv6.conf.default.disable_ipv6: 1
+    mem_limit: ${MEM_LIMIT:-6g}
+    pids_limit: 2048
+    healthcheck:
+      test: ["CMD", "test", "-f", "/run/sandbox/ready"]
+      interval: 5s
+      timeout: 3s
+      retries: 60
+    stdin_open: true
+    tty: true
+    restart: unless-stopped
+
+volumes:
+  workspace:
+  agent-config:

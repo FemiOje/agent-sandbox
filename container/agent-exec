@@ -1,0 +1,36 @@
+#!/bin/sh
+#
+# agent-exec COMMAND [ARGS...]
+#
+# Runs COMMAND as the unprivileged agent user with root privileges revoked:
+#   - switches to the agent's uid/gid and clears supplementary groups
+#   - empties the capability bounding set, so no process in the agent's tree
+#     can ever hold NET_ADMIN (or any other capability) again, even via a
+#     setuid program or file capabilities
+#   - sets no_new_privs, so execve() can never grant more privileges
+#
+# Every agent-facing process goes through this: the container's main process
+# (via entrypoint.sh), `./sandbox shell`, `./sandbox claude` and `./sandbox run`.
+
+set -eu
+
+AGENT_USER="${AGENT_USER:-node}"
+[ "$#" -gt 0 ] || set -- bash -l
+
+if [ "$(id -u)" != "0" ]; then
+  # Already unprivileged: nothing left to drop.
+  exec "$@"
+fi
+
+uid="$(id -u "$AGENT_USER")"
+gid="$(id -g "$AGENT_USER")"
+HOME="$(getent passwd "$AGENT_USER" | cut -d: -f6)"
+USER="$AGENT_USER"
+LOGNAME="$AGENT_USER"
+export HOME USER LOGNAME
+
+exec setpriv \
+  --reuid="$uid" --regid="$gid" --clear-groups \
+  --inh-caps=-all --ambient-caps=-all --bounding-set=-all \
+  --no-new-privs \
+  -- "$@"

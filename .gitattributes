@@ -1,0 +1,6 @@
+# Keep Linux line endings, even if the repo is cloned on Windows.
+# (Windows line endings break shell scripts: "/bin/sh^M: bad interpreter")
+* text=auto eol=lf
+sandbox text eol=lf
+*.sh text eol=lf
+container/* text eol=lf
