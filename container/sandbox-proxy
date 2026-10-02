@@ -1,0 +1,412 @@
+#!/usr/bin/env python3
+#
+# sandbox-proxy: the sandbox's only way out to the internet.
+#
+# iptables redirects every outgoing web connection (OUTBOUND_PORTS) to this
+# proxy. For each connection it reads the hostname the client asked for (the
+# TLS SNI field, or the HTTP Host header; nothing is decrypted), looks the
+# name up itself, and then:
+#
+#   local address or name      -> refused, never asked: your PC, WSL, your
+#                                 network, Docker's networks, localhost-style
+#                                 names, and public names that resolve to any
+#                                 of those
+#   on allowed-domains.txt     -> connected
+#   answered this session      -> as you answered
+#   anything else              -> held until you answer in ./sandbox approve,
+#                                 refused if nobody answers in APPROVAL_TIMEOUT
+#
+# It connects to the address it resolved, never to the one the client picked,
+# so a client can't pair an allowed name with another server's IP.
+#
+# Runs as its own user (sbxproxy). Only that user may connect out (see
+# init-firewall.sh). The agent can't read or write the state directory, so it
+# can't see the queue or answer for you; answers come from proxy-ctl.
+
+import asyncio
+import ipaddress
+import os
+import re
+import socket
+import struct
+import sys
+import time
+
+STATE_DIR = os.environ.get("PROXY_STATE_DIR", "/run/sandbox/proxy")
+DOMAINS_FILE = os.environ.get("DOMAINS_FILE", "/etc/sandbox/allowed-domains.txt")
+LISTEN_PORT = int(os.environ.get("PROXY_PORT", "15001"))
+OUTBOUND_PORTS = {int(p) for p in os.environ.get("OUTBOUND_PORTS", "80,443").split(",") if p.strip()}
+APPROVAL_TIMEOUT = float(os.environ.get("APPROVAL_TIMEOUT", "120"))
+
+PENDING_TTL = 600      # drop unanswered requests after 10 minutes of silence
+MAX_PENDING = 50       # beyond this, new sites are refused instead of queued
+HEAD_TIMEOUT = 10      # time for a client to send its TLS hello / HTTP headers
+CONNECT_TIMEOUT = 15
+SO_ORIGINAL_DST = 80   # from linux/netfilter_ipv4.h
+
+PENDING_DIR = os.path.join(STATE_DIR, "pending")
+DECISIONS_DIR = os.path.join(STATE_DIR, "decisions")
+LOG_FILE = os.path.join(STATE_DIR, "log.txt")
+
+LABEL = r"[a-z0-9_](?:[a-z0-9_-]{0,61}[a-z0-9_])?"
+HOST_RE = re.compile(rf"^(?=.{{1,253}}$){LABEL}(?:\.{LABEL})*$")
+IPV4_RE = re.compile(r"^\d{1,3}(?:\.\d{1,3}){3}$")
+
+# Names that only mean something on a local network. Never asked about.
+LOCAL_NAMES = ("localhost", "local", "localdomain", "internal", "lan", "home", "home.arpa")
+# Reserved for documentation and tests (RFC 2606); the self-checks use them.
+RESERVED_NAMES = ("example", "invalid", "test", "example.com", "example.net", "example.org")
+
+
+def log(msg):
+    print(f"[proxy] {msg}", file=sys.stderr, flush=True)
+    try:
+        if os.path.getsize(LOG_FILE) > 1_000_000:
+            os.replace(LOG_FILE, LOG_FILE + ".1")
+    except OSError:
+        pass
+    try:
+        with open(LOG_FILE, "a") as f:
+            f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {msg}\n")
+    except OSError:
+        pass
+
+
+def under(host, domain):
+    return host == domain or host.endswith("." + domain)
+
+
+def is_public(ip):
+    return ip.is_global and not (ip.is_multicast or ip.is_reserved or ip.is_unspecified)
+
+
+class Allowlist:
+    """allowed-domains.txt, reread whenever it changes.
+
+    "example.com" allows that name only; ".example.com" (or "*.example.com")
+    allows it and every subdomain; an IP or CIDR allows connections made to
+    that address directly (no hostname).
+    """
+
+    def __init__(self, path):
+        self.path = path
+        self.mtime = None
+        self.exact, self.suffixes, self.nets = set(), set(), []
+
+    def refresh(self):
+        try:
+            mtime = os.stat(self.path).st_mtime_ns
+        except OSError:
+            return
+        if mtime == self.mtime:
+            return
+        exact, suffixes, nets = set(), set(), []
+        with open(self.path, encoding="utf-8", errors="replace") as f:
+            for line in f:
+                entry = "".join(line.split("#", 1)[0].split()).lower().rstrip(".")
+                if not entry:
+                    continue
+                if entry.startswith("*."):
+                    suffixes.add(entry[2:])
+                elif entry.startswith("."):
+                    suffixes.add(entry[1:])
+                else:
+                    try:
+                        nets.append(ipaddress.ip_network(entry, strict=False))
+                    except ValueError:
+                        exact.add(entry)
+        self.mtime = mtime
+        self.exact, self.suffixes, self.nets = exact, suffixes, nets
+        log(f"allowlist loaded: {len(exact)} names, {len(suffixes)} wildcards, {len(nets)} addresses")
+
+    def allows_host(self, host):
+        self.refresh()
+        return host in self.exact or any(under(host, s) for s in self.suffixes)
+
+    def allows_ip(self, ip):
+        self.refresh()
+        return any(ip in net for net in self.nets)
+
+
+class Approvals:
+    """Your answers for this session, and the requests waiting for one.
+
+    Waiting requests are files in pending/ (one per host); proxy-ctl answers
+    by writing allow/deny/forget into decisions/<host>.
+    """
+
+    def __init__(self):
+        self.allowed, self.denied = set(), set()
+        self.pending = {}  # host -> {"port", "first", "last", "count", "event"}
+
+    def reset_dirs(self):
+        for d in (PENDING_DIR, DECISIONS_DIR):
+            os.makedirs(d, exist_ok=True)
+            for name in os.listdir(d):
+                os.remove(os.path.join(d, name))
+
+    def _write_pending(self, host):
+        p = self.pending[host]
+        tmp = os.path.join(PENDING_DIR, f".{host}.tmp")
+        with open(tmp, "w") as f:
+            f.write(f"{int(p['first'])}\t{p['port']}\t{p['count']}\n")
+        os.replace(tmp, os.path.join(PENDING_DIR, host))
+
+    def _drop_pending(self, host):
+        p = self.pending.pop(host, None)
+        try:
+            os.remove(os.path.join(PENDING_DIR, host))
+        except OSError:
+            pass
+        return p
+
+    async def ask(self, host, port):
+        """Wait for your answer. Returns "allow", "deny", "timeout" or "full"."""
+        now = time.time()
+        p = self.pending.get(host)
+        if p is None:
+            if len(self.pending) >= MAX_PENDING:
+                return "full"
+            p = self.pending[host] = {"port": port, "first": now, "last": now, "count": 0,
+                                      "event": asyncio.Event()}
+            log(f"ASK   {host}:{port}  waiting for your answer (./sandbox approve)")
+        p["count"] += 1
+        p["last"] = now
+        self._write_pending(host)
+        try:
+            await asyncio.wait_for(p["event"].wait(), APPROVAL_TIMEOUT)
+        except asyncio.TimeoutError:
+            return "timeout"
+        return "allow" if host in self.allowed else "deny"
+
+    def apply(self, host, verdict):
+        if verdict == "allow":
+            self.allowed.add(host)
+            self.denied.discard(host)
+        elif verdict == "deny":
+            self.denied.add(host)
+            self.allowed.discard(host)
+        elif verdict == "forget":
+            self.allowed.discard(host)
+            self.denied.discard(host)
+        else:
+            return
+        log(f"{verdict.upper():5} {host}  (your answer, until the sandbox restarts)")
+        p = self._drop_pending(host)
+        if p:
+            p["event"].set()
+
+    async def watch(self):
+        while True:
+            await asyncio.sleep(0.3)
+            try:
+                names = os.listdir(DECISIONS_DIR)
+            except OSError:
+                names = []
+            for name in names:
+                if name.startswith("."):
+                    continue
+                path = os.path.join(DECISIONS_DIR, name)
+                try:
+                    with open(path) as f:
+                        verdict = f.read().strip()
+                    os.remove(path)
+                except OSError:
+                    continue
+                if HOST_RE.match(name):
+                    self.apply(name, verdict)
+            now = time.time()
+            for host in [h for h, p in self.pending.items() if now - p["last"] > PENDING_TTL]:
+                self._drop_pending(host)["event"].set()
+
+
+def original_dst(sock):
+    raw = sock.getsockopt(socket.SOL_IP, SO_ORIGINAL_DST, 16)
+    port, packed = struct.unpack("!2xH4s8x", raw)
+    return socket.inet_ntoa(packed), port
+
+
+def parse_sni(hello):
+    """Server name from a TLS ClientHello handshake message, or None."""
+    try:
+        if hello[0] != 1:  # not a ClientHello
+            return None
+        p = 4 + 2 + 32                                   # header, version, random
+        p += 1 + hello[p]                                # session id
+        p += 2 + int.from_bytes(hello[p:p + 2], "big")   # cipher suites
+        p += 1 + hello[p]                                # compression methods
+        end = min(len(hello), p + 2 + int.from_bytes(hello[p:p + 2], "big"))
+        p += 2
+        while p + 4 <= end:
+            ext_type = int.from_bytes(hello[p:p + 2], "big")
+            ext_len = int.from_bytes(hello[p + 2:p + 4], "big")
+            p += 4
+            if ext_type == 0:  # server_name
+                data, q = hello[p:p + ext_len], 2
+                while q + 3 <= len(data):
+                    name_len = int.from_bytes(data[q + 1:q + 3], "big")
+                    if data[q] == 0:
+                        return data[q + 3:q + 3 + name_len].decode("ascii")
+                    q += 3 + name_len
+                return None
+            p += ext_len
+    except (IndexError, UnicodeDecodeError):
+        pass
+    return None
+
+
+def parse_host_header(head):
+    for line in head.split(b"\r\n")[1:]:
+        name, sep, value = line.partition(b":")
+        if sep and name.strip().lower() == b"host":
+            value = value.strip().decode("ascii", "replace")
+            return None if value.startswith("[") else value.rsplit(":", 1)[0]
+    return None
+
+
+async def read_head(reader):
+    """Read the client's first message. Returns (kind, raw bytes, hostname)."""
+    first = await reader.readexactly(1)
+    if first == b"\x16":  # TLS handshake record
+        header = first + await reader.readexactly(4)
+        length = struct.unpack("!H", header[3:5])[0]
+        if length > 18432:
+            raise ValueError("TLS record too long")
+        body = await reader.readexactly(length)
+        return "tls", header + body, parse_sni(body)
+    head = first + await reader.readuntil(b"\r\n\r\n")
+    return "http", head, parse_host_header(head)
+
+
+async def resolve(host):
+    loop = asyncio.get_running_loop()
+    try:
+        infos = await asyncio.wait_for(
+            loop.getaddrinfo(host, None, family=socket.AF_INET, type=socket.SOCK_STREAM), 10)
+    except (OSError, asyncio.TimeoutError):
+        return []
+    return list(dict.fromkeys(info[4][0] for info in infos))
+
+
+async def pipe(reader, writer):
+    try:
+        while data := await reader.read(65536):
+            writer.write(data)
+            await writer.drain()
+        if writer.can_write_eof():
+            writer.write_eof()
+    except OSError:
+        writer.close()
+
+
+class Proxy:
+    def __init__(self):
+        self.allowlist = Allowlist(DOMAINS_FILE)
+        self.approvals = Approvals()
+        self.logged = set()
+
+    async def decide(self, host, port, named):
+        """Returns (True, addresses) or (False, reason)."""
+        if IPV4_RE.match(host):
+            try:
+                ip = ipaddress.ip_address(host)
+            except ValueError:
+                return False, "invalid address"
+            if not is_public(ip):
+                return False, "local/private address (never allowed)"
+            if self.allowlist.allows_ip(ip):
+                return True, [host]
+            why = "bare IP address" if named else "no hostname sent"
+            return False, f"{why}; add the IP to allowed-domains.txt to allow it"
+        if not HOST_RE.match(host):
+            return False, "invalid hostname"
+        if "." not in host or any(under(host, d) for d in LOCAL_NAMES):
+            return False, "local network name (never allowed)"
+        if any(under(host, d) for d in RESERVED_NAMES):
+            return False, "reserved example/test name (never allowed)"
+
+        # Resolve before anything else, so a name that points at a local
+        # address is refused outright instead of being offered to you.
+        addrs = await resolve(host)
+        if not addrs:
+            return False, "name does not resolve"
+        local = [a for a in addrs if not is_public(ipaddress.ip_address(a))]
+        if local:
+            return False, f"resolves to local address {local[0]} (never allowed)"
+
+        if self.allowlist.allows_host(host) or host in self.approvals.allowed:
+            return True, addrs
+        if host in self.approvals.denied:
+            return False, "you denied it (until the sandbox restarts)"
+        answer = await self.approvals.ask(host, port)
+        if answer == "allow":
+            return True, addrs
+        return False, {
+            "deny": "you denied it",
+            "timeout": f"no answer within {APPROVAL_TIMEOUT:.0f}s (still listed in ./sandbox approve)",
+            "full": f"more than {MAX_PENDING} sites waiting for an answer",
+        }[answer]
+
+    async def handle(self, reader, writer):
+        upstream = None
+        try:
+            try:
+                dst_ip, dst_port = original_dst(writer.get_extra_info("socket"))
+            except OSError:
+                return
+            # Only connections iptables redirected; not ones made to this port.
+            if dst_port not in OUTBOUND_PORTS or ipaddress.ip_address(dst_ip).is_loopback:
+                return
+            try:
+                kind, head, name = await asyncio.wait_for(read_head(reader), HEAD_TIMEOUT)
+            except (asyncio.TimeoutError, asyncio.IncompleteReadError,
+                    asyncio.LimitOverrunError, ValueError, OSError):
+                return
+            host = (name or dst_ip).strip().lower().rstrip(".")
+
+            ok, result = await self.decide(host, dst_port, named=bool(name))
+            if not ok:
+                log(f"DENY  {host}:{dst_port}  {result}")
+                if kind == "http":
+                    body = f"Blocked by the sandbox proxy: {host}: {result}\n".encode()
+                    writer.write(b"HTTP/1.1 403 Forbidden\r\nContent-Type: text/plain\r\n"
+                                 b"Connection: close\r\nContent-Length: %d\r\n\r\n" % len(body) + body)
+                    await writer.drain()
+                return
+
+            for addr in result:
+                try:
+                    up_reader, upstream = await asyncio.wait_for(
+                        asyncio.open_connection(addr, dst_port), CONNECT_TIMEOUT)
+                    break
+                except (OSError, asyncio.TimeoutError) as e:
+                    log(f"FAIL  {host}:{dst_port}  could not connect to {addr}: {e or 'timeout'}")
+            if upstream is None:
+                return
+            if host not in self.logged:
+                self.logged.add(host)
+                log(f"ALLOW {host}:{dst_port}")
+            upstream.write(head)
+            await asyncio.gather(pipe(reader, upstream), pipe(up_reader, writer))
+        except OSError:
+            pass
+        finally:
+            for w in (writer, upstream):
+                if w is not None:
+                    w.close()
+
+
+async def main():
+    os.umask(0o077)
+    proxy = Proxy()
+    proxy.approvals.reset_dirs()
+    proxy.allowlist.refresh()
+    server = await asyncio.start_server(proxy.handle, "127.0.0.1", LISTEN_PORT, reuse_address=True)
+    log(f"listening on 127.0.0.1:{LISTEN_PORT}; unlisted sites wait {APPROVAL_TIMEOUT:.0f}s for an answer")
+    watcher = asyncio.create_task(proxy.approvals.watch())
+    async with server:
+        await asyncio.gather(server.serve_forever(), watcher)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())

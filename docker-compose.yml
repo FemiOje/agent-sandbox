@@ -21,12 +21,13 @@ services:
       - no-new-privileges:true
     environment:
       INBOUND_PORTS: "3000,8545"
+      APPROVAL_TIMEOUT: ${APPROVAL_TIMEOUT:-120}
       DNS_ALLOW_ANY: ${DNS_ALLOW_ANY:-false}
       IPTABLES: ${IPTABLES:-iptables}
     volumes:
-      # Read-only allowlist. Everything else is a named volume: no folders
-      # from your PC or WSL are mounted.
-      - ./allowed-domains.txt:/etc/sandbox/allowed-domains.txt:ro
+      # Read-only allowlist. Mount the directory (not a single file) so
+      # Docker Desktop on WSL2 can resolve the bind-mount path correctly.
+      - ./config:/etc/sandbox:ro
       - workspace:/home/node/work
       - agent-config:/home/node/.claude
     ports:
@@ -47,6 +48,29 @@ services:
     tty: true
     restart: unless-stopped
 
+  postgres:
+    image: postgres:16
+    network_mode: "service:sandbox"
+    depends_on:
+      sandbox:
+        condition: service_healthy
+    environment:
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_DB: ${POSTGRES_DB:-mydb}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    restart: unless-stopped
+
+  redis:
+    image: redis:7
+    network_mode: "service:sandbox"
+    depends_on:
+      sandbox:
+        condition: service_healthy
+    restart: unless-stopped
+
 volumes:
   workspace:
   agent-config:
+  pgdata:

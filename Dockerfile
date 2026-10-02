@@ -35,15 +35,23 @@ USER root
 # ---------------------------------------------------------------------------
 # Sandbox security layer (keep everything below this line project-agnostic)
 # ---------------------------------------------------------------------------
-COPY container/init-firewall.sh container/entrypoint.sh container/agent-exec /usr/local/sbin/
+COPY container/init-firewall.sh container/entrypoint.sh container/agent-exec \
+     container/sandbox-proxy container/proxy-ctl /usr/local/sbin/
 COPY container/root-bashrc /root/.bashrc
 
 # Strip Windows line endings in case files were edited on Windows; root-owned
 # and not writable by the agent.
-RUN sed -i 's/\r$//' /usr/local/sbin/init-firewall.sh /usr/local/sbin/entrypoint.sh \
-      /usr/local/sbin/agent-exec /root/.bashrc \
-    && chown root:root /usr/local/sbin/init-firewall.sh /usr/local/sbin/entrypoint.sh /usr/local/sbin/agent-exec \
-    && chmod 755 /usr/local/sbin/init-firewall.sh /usr/local/sbin/entrypoint.sh /usr/local/sbin/agent-exec
+RUN cd /usr/local/sbin \
+    && sed -i 's/\r$//' init-firewall.sh entrypoint.sh agent-exec sandbox-proxy proxy-ctl /root/.bashrc \
+    && chown root:root init-firewall.sh entrypoint.sh agent-exec sandbox-proxy proxy-ctl \
+    && chmod 755 init-firewall.sh entrypoint.sh agent-exec sandbox-proxy proxy-ctl
+
+# The approval proxy's own user: the only one the firewall lets connect out.
+# Its state (the approval queue) is private to it, so the agent can't read it
+# or answer for you.
+RUN useradd --system --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin sbxproxy \
+    && mkdir -p /run/sandbox/proxy \
+    && chown sbxproxy:sbxproxy /run/sandbox/proxy && chmod 700 /run/sandbox/proxy
 
 # Remove setuid/setgid bits from every binary (su, passwd, mount, ...), so
 # there is nothing the agent could use to become root.

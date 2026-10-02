@@ -15,6 +15,10 @@ TEST_BLOCKED_PORT_TARGET="${TEST_BLOCKED_PORT_TARGET:-github.com:22}"
 TEST_DNS_SERVER="${TEST_DNS_SERVER:-1.1.1.1}"
 HOST_TEST_IP="${HOST_TEST_IP:-}"
 HOST_TEST_PORT="${HOST_TEST_PORT:-}"
+TEST_GATEWAY_IP="${TEST_GATEWAY_IP:-}"
+TEST_REBIND_HOST="${TEST_REBIND_HOST:-localtest.me}"
+PROXY_USER="${PROXY_USER:-sbxproxy}"
+PROXY_PORT="${PROXY_PORT:-15001}"
 
 pass=0; fail=0; skip=0
 ok()   { echo "PASS  $1"; pass=$((pass + 1)); }
@@ -76,6 +80,24 @@ expect_fail "cannot modify the firewall script" sh -c ': >> /usr/local/sbin/init
 expect_fail "cannot modify the privilege-drop script" sh -c ': >> /usr/local/sbin/agent-exec'
 expect_fail "cannot modify the entrypoint" sh -c ': >> /usr/local/sbin/entrypoint.sh'
 
+echo "== Approval proxy: the agent cannot get around it or answer for you"
+proxy_pids="$(pgrep -u "$PROXY_USER" | tr '\n' ' ')"
+proxy_caps_ok=true
+for pid in $proxy_pids; do caps_zero "$pid" || proxy_caps_ok=false; done
+if [ -n "$proxy_pids" ] && $proxy_caps_ok; then ok "the proxy runs as '$PROXY_USER' with no capabilities"
+else bad "the proxy runs unprivileged" "pids: ${proxy_pids:-none}"; fi
+# shellcheck disable=SC2086
+expect_fail "cannot stop the proxy" kill -TERM $proxy_pids
+expect_fail "cannot read the approval queue" ls /run/sandbox/proxy/pending
+expect_fail "cannot write its own approval" sh -c 'echo allow > /run/sandbox/proxy/decisions/evil.example.org'
+expect_fail "cannot approve through proxy-ctl" proxy-ctl allow evil.example.org
+expect_fail "cannot modify the proxy" sh -c ': >> /usr/local/sbin/sandbox-proxy'
+allowed_host="$(echo "$TEST_ALLOWED_URL" | sed -E 's#^[a-z]+://##; s#[:/].*$##')"
+expect_fail "cannot use the proxy port directly (127.0.0.1:$PROXY_PORT)" \
+  curl -s --max-time 10 -o /dev/null --connect-to "$allowed_host:443:127.0.0.1:$PROXY_PORT" "$TEST_ALLOWED_URL"
+expect_fail "a bare IP with no hostname is refused (https://$TEST_DNS_SERVER)" \
+  curl -sk --max-time 10 -o /dev/null "https://$TEST_DNS_SERVER"
+
 echo "== Host: no access to your computer's files or Docker"
 if [ ! -e /var/run/docker.sock ] && [ ! -e /run/docker.sock ]; then ok "no Docker socket (can't start containers on the host)"
 else bad "no Docker socket" "socket present"; fi
@@ -90,8 +112,7 @@ if [ -z "$unexpected" ]; then ok "only the expected mounts exist (allowlist read
 else bad "only expected mounts" "unexpected:$unexpected"; fi
 
 echo "== Network: default deny"
-allowed_host="$(echo "$TEST_ALLOWED_URL" | sed -E 's#^[a-z]+://##; s#[:/].*$##')"
-expect_ok   "DNS works through Docker's resolver ($allowed_host)" getent hosts "$allowed_host"
+expect_ok  "DNS works through Docker's resolver ($allowed_host)" getent hosts "$allowed_host"
 expect_ok   "allowlisted site is reachable ($TEST_ALLOWED_URL)" curl -s --connect-timeout 10 --max-time 20 -o /dev/null "$TEST_ALLOWED_URL"
 expect_fail "other sites are blocked ($TEST_BLOCKED_URL)" curl -s --connect-timeout 6 --max-time 10 -o /dev/null "$TEST_BLOCKED_URL"
 expect_fail "non-web ports are blocked, even to allowed hosts ($TEST_BLOCKED_PORT_TARGET)" tcp_connect "${TEST_BLOCKED_PORT_TARGET%:*}" "${TEST_BLOCKED_PORT_TARGET##*:}"
@@ -101,6 +122,29 @@ if [ -n "$HOST_TEST_IP" ] && [ -n "$HOST_TEST_PORT" ]; then
 else
   skp "your computer (WSL host) is unreachable" "the control found no path to test, so this would prove nothing"
 fi
+
+echo "== Local hosts: refused on web ports too, without asking you"
+# Each goes through the proxy over plain HTTP, so its 403 says why.
+proxy_says() { curl -s --max-time 10 "$@" 2>/dev/null; }
+if [ -n "$TEST_GATEWAY_IP" ]; then
+  out="$(proxy_says "http://$TEST_GATEWAY_IP/")"
+  case "$out" in *"never allowed"*) ok "your computer's address is refused (http://$TEST_GATEWAY_IP/)" ;;
+    *) bad "your computer's address is refused (http://$TEST_GATEWAY_IP/)" "${out:-no answer}" ;; esac
+else
+  skp "your computer's address is refused on port 80" "no gateway address found"
+fi
+out="$(proxy_says --resolve "host.docker.internal:80:$TEST_DNS_SERVER" http://host.docker.internal/)"
+case "$out" in *"never allowed"*) ok "local network names are refused (host.docker.internal)" ;;
+  *) bad "local network names are refused (host.docker.internal)" "${out:-no answer}" ;; esac
+# A public name that points at a local address. The client is told to go to
+# a public IP, so only the proxy's own lookup can catch it.
+out="$(proxy_says --resolve "$TEST_REBIND_HOST:80:$TEST_DNS_SERVER" "http://$TEST_REBIND_HOST/")"
+case "$out" in
+  *"resolves to local address"*) ok "public names that resolve to local addresses are refused ($TEST_REBIND_HOST)" ;;
+  *"does not resolve"*) skp "public names that resolve to local addresses are refused" "$TEST_REBIND_HOST does not resolve" ;;
+  *) bad "public names that resolve to local addresses are refused ($TEST_REBIND_HOST)" "${out:-no answer}" ;;
+esac
+
 if [ ! -d /proc/sys/net/ipv6 ]; then ok "IPv6 is unavailable (kernel has no IPv6; no way around the IPv4 rules)"
 elif [ "$(cat /proc/sys/net/ipv6/conf/all/disable_ipv6 2>/dev/null)" = "1" ]; then ok "IPv6 is disabled (no way around the IPv4 rules)"
 else bad "IPv6 is disabled"; fi

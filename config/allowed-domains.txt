@@ -1,6 +1,14 @@
-# What the sandbox may reach over HTTP/HTTPS. One entry per line: a domain,
-# an IPv4 address or an IPv4 CIDR. "#" starts a comment.
-# After editing, apply with:  ./sandbox firewall
+# Sites the sandbox may reach over HTTP/HTTPS without asking you. Anything
+# else waits for your answer in ./sandbox approve. Your computer, WSL and
+# your local network are never reachable, whatever this file says.
+#
+# One entry per line, "#" starts a comment:
+#   example.com       that name only
+#   .example.com      that name and every subdomain (*.example.com works too)
+#   203.0.113.7       connections made to that IP directly (also CIDRs)
+#
+# Changes apply on their own within a request or two. If one doesn't (some
+# editors replace the file instead of changing it), run: docker compose restart
 
 # --- Package registries (npm, yarn, Corepack's Yarn downloads) ---
 registry.npmjs.org
@@ -8,13 +16,8 @@ registry.yarnpkg.com
 repo.yarnpkg.com
 
 # --- GitHub (git clone, submodules like forge-std, release downloads) ---
-# GitHub's own IP ranges are added automatically; these cover the CDN hosts.
-github.com
-api.github.com
-codeload.github.com
-raw.githubusercontent.com
-objects.githubusercontent.com
-release-assets.githubusercontent.com
+.github.com
+.githubusercontent.com
 
 # --- Solidity compiler downloads (Foundry and Hardhat) ---
 binaries.soliditylang.org
@@ -30,9 +33,9 @@ api.vercel.com
 
 # --- Claude Code (remove if you use a different agent) ---
 api.anthropic.com
-claude.ai
-console.anthropic.com
-statsig.anthropic.com
+.anthropic.com
+.claude.ai
+.claude.com
 statsig.com
 sentry.io
 
@@ -43,3 +46,6 @@ sentry.io
 # sepolia.infura.io             # Infura instead of Alchemy
 # pypi.org                      # Python projects
 # files.pythonhosted.org
+context7.com   # approved 2026-09-30
+mcp.context7.com   # approved 2026-09-30
+orm.drizzle.team   # approved 2026-09-30

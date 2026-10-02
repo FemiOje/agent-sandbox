@@ -17,7 +17,10 @@ Usage: ./sandbox <command>
   claude [args]     Run Claude Code as the agent user
   run <cmd...>      Run any command as the agent user
   admin             Open a ROOT shell (for you only; can change the firewall)
-  firewall          Re-apply the firewall after editing allowed-domains.txt
+  approve [--once]  Answer the agent's requests for sites not in allowed-domains.txt
+                    (keeps watching until Ctrl+C; --once answers what's waiting now)
+  netlog [N]        Show the last N proxy log lines: allowed, asked, denied (default 50)
+  firewall          Re-apply the firewall rules
   test              Run the security tests against the running sandbox
   status            Show container status
   logs              Follow container logs
@@ -27,6 +30,48 @@ Usage: ./sandbox <command>
   down              Remove the container (keeps your code in the volume)
   destroy           Remove the container AND the volumes (deletes your code)
 EOF
+}
+
+# Talk to the approval proxy (runs as root, then as the proxy user; see
+# container/proxy-ctl). stdin is closed so it can't eat a caller's input.
+proxy_ctl() { dc exec -T "$SERVICE" proxy-ctl "$@" </dev/null | tr -d '\r'; }
+
+add_allowed() {
+  local f=allowed-domains.txt
+  grep -qE "^[[:space:]]*$(printf '%s' "$1" | sed 's/[.]/\\./g')([[:space:]#]|$)" "$f" && return 0
+  [ -z "$(tail -c1 "$f")" ] || echo >> "$f"
+  # Append, don't rewrite: the container sees the file through a bind mount
+  # of this exact inode.
+  printf '%s   # approved %s\n' "$1" "$(date +%F)" >> "$f"
+}
+
+approve() {
+  local watch=true skipped=" " shown list host since port count ans
+  [ "${1:-}" = "--once" ] && watch=false
+  $watch && echo "Waiting for the agent to ask for new sites (Ctrl+C to stop)..."
+  while :; do
+    list="$(proxy_ctl list)" || return 1
+    shown=false
+    while IFS=$'\t' read -r host since port count; do
+      [ -n "$host" ] || continue
+      case "$skipped" in *" $host "*) continue ;; esac
+      shown=true
+      printf '\a\n  %s   (port %s, %s request(s), waiting %ss)\n' \
+        "$host" "$port" "$count" "$(( $(date +%s) - since ))"
+      read -r -p "  [a]llow this session, [A]lways (add to allowed-domains.txt), [d]eny, [s]kip? " ans </dev/tty
+      case "$ans" in
+        a) proxy_ctl allow "$host" && echo "  allowed until the sandbox restarts" ;;
+        A) add_allowed "$host" && proxy_ctl allow "$host" && echo "  added to allowed-domains.txt" ;;
+        d) proxy_ctl deny "$host" && echo "  denied until the sandbox restarts" ;;
+        *) skipped="$skipped$host "; echo "  skipped (still waiting)" ;;
+      esac
+    done <<< "$list"
+    if ! $watch; then
+      $shown || echo "No sites are waiting for an answer."
+      return 0
+    fi
+    sleep 1
+  done
 }
 
 cmd="${1:-help}"
@@ -39,6 +84,8 @@ case "$cmd" in
   run)      [ "$#" -gt 0 ] || { echo "usage: ./sandbox run <command...>"; exit 1; }
             dc exec "$SERVICE" agent-exec "$@" ;;
   admin)    dc exec "$SERVICE" bash ;;
+  approve)  approve "$@" ;;
+  netlog)   proxy_ctl log "${1:-50}" ;;
   firewall) dc exec "$SERVICE" init-firewall.sh ;;
   test)     ./tests/run-tests.sh "$@" ;;
   status)   dc ps ;;

@@ -51,7 +51,7 @@ The defaults work for Speedrun Ethereum: frontend on `localhost:3000`, chain on
 The test run should end with `0 failed`, e.g.:
 
 ```
-Summary: 39 passed, 0 failed, 0 skipped
+Summary: 55 passed, 0 failed, 0 skipped
 ```
 
 A SKIP on a "control" line means that target couldn't be reached even from
@@ -121,7 +121,7 @@ code stay out of the repo.
 
 **e. Watch the tests run on GitHub.** Open the repo's **Actions** tab. The
 "sandbox security tests" workflow builds the image and runs `./sandbox test` on
-every push. A green check means all 39 checks passed on a clean machine.
+every push. A green check means all 55 checks passed on a clean machine.
 
 **f. Make it a template.** In the repo's **Settings → General**, tick
 **Template repository**.
@@ -153,7 +153,7 @@ Then, for either option:
 ```bash
 cp .env.example .env
 nano .env                      # change FRONTEND_PORT/CHAIN_PORT if another sandbox is running
-nano allowed-domains.txt       # add the sites this project needs
+nano config/allowed-domains.txt  # optional: sites this project always needs (others: ./sandbox approve)
 ./sandbox up && ./sandbox test
 ```
 
@@ -180,7 +180,8 @@ repo. There are two ways to get it onto GitHub:
 ./sandbox shell     # agent shell
 ./sandbox claude    # Claude Code
 ./sandbox admin     # root shell for you (never run agents here)
-./sandbox firewall  # after editing allowed-domains.txt
+./sandbox approve   # answer the agent's requests for new sites (second terminal)
+./sandbox netlog    # what the proxy allowed, asked about and denied
 ./sandbox test      # security tests
 ./sandbox stop      # stop (keeps code)
 ```

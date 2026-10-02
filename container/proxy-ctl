@@ -1,0 +1,53 @@
+#!/bin/sh
+#
+# proxy-ctl: answer the approval proxy. For you, not the agent: run it from
+# WSL through ./sandbox approve, or as root in ./sandbox admin.
+#
+#   proxy-ctl list              sites waiting for an answer (host, since, port, requests)
+#   proxy-ctl allow HOST        allow until the sandbox restarts
+#   proxy-ctl deny HOST         deny until the sandbox restarts
+#   proxy-ctl forget HOST       drop your answer, so the next request asks again
+#   proxy-ctl log [N]           last N lines of the proxy log (default 50)
+#
+# Root re-runs this as the proxy user, which owns the proxy's state. The agent
+# is neither, and has no way to become either, so it can't answer for you.
+
+set -eu
+
+PROXY_USER="${PROXY_USER:-sbxproxy}"
+STATE="${PROXY_STATE_DIR:-/run/sandbox/proxy}"
+
+if [ "$(id -u)" = "0" ]; then
+  exec setpriv \
+    --reuid="$(id -u "$PROXY_USER")" --regid="$(id -g "$PROXY_USER")" --clear-groups \
+    --inh-caps=-all --ambient-caps=-all --bounding-set=-all --no-new-privs \
+    -- /usr/local/sbin/proxy-ctl "$@"
+fi
+if [ "$(id -un)" != "$PROXY_USER" ]; then
+  echo "proxy-ctl: only you can answer the proxy (from WSL: ./sandbox approve)" >&2
+  exit 1
+fi
+umask 077
+
+cmd="${1:-list}"
+case "$cmd" in
+  list)
+    for f in "$STATE"/pending/*; do
+      [ -f "$f" ] || continue
+      printf '%s\t%s\n' "${f##*/}" "$(cat "$f")"
+    done ;;
+  allow|deny|forget)
+    host="$(printf '%s' "${2:-}" | tr 'A-Z' 'a-z')"
+    if ! printf '%s\n' "$host" | grep -Eq '^[a-z0-9_]([a-z0-9_.-]{0,251}[a-z0-9_])?$' \
+       || printf '%s' "$host" | grep -q '\.\.'; then
+      echo "proxy-ctl: invalid host '${2:-}'" >&2
+      exit 1
+    fi
+    printf '%s\n' "$cmd" > "$STATE/decisions/.$host.tmp"
+    mv "$STATE/decisions/.$host.tmp" "$STATE/decisions/$host" ;;
+  log)
+    tail -n "${2:-50}" "$STATE/log.txt" 2>/dev/null || true ;;
+  *)
+    echo "usage: proxy-ctl list | allow HOST | deny HOST | forget HOST | log [N]" >&2
+    exit 1 ;;
+esac
